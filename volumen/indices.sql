@@ -39,6 +39,19 @@ SELECT *
 FROM detalle_pedido
 WHERE id_pedido = 12500;
 
--- Índice para Consulta 3:
-CREATE INDEX idx_detalle_pedido_id_pedido
-ON detalle_pedido (id_pedido);
+-- CORREGIDO (revisión posterior, ver duia.md — Parte A, "Segundo caso
+-- de sobreindexación"): NO se crea un índice nuevo acá.
+-- La tabla ya tiene, por el UNIQUE(id_pedido, id_producto) de
+-- schema.sql, un índice compuesto que empieza por id_pedido
+-- (detalle_pedido_id_pedido_id_producto_key). Ese índice ya resuelve
+-- esta consulta por prefijo izquierdo: se probó con y sin un índice
+-- adicional sobre (id_pedido) y el plan y el tiempo fueron idénticos
+-- (Index Scan usando detalle_pedido_id_pedido_id_producto_key en
+-- ambos casos). Crear idx_detalle_pedido_id_pedido sería un índice
+-- redundante: mismo costo de mantenimiento en cada INSERT/UPDATE de
+-- detalle_pedido, sin ninguna mejora real de lectura.
+--
+-- (Se deja comentado el índice originalmente propuesto, como
+-- evidencia de qué se descartó y por qué:)
+-- CREATE INDEX idx_detalle_pedido_id_pedido
+-- ON detalle_pedido (id_pedido);
