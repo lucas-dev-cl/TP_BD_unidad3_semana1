@@ -1,5 +1,48 @@
-# Informe de Mediciones — Parte B: Vistas
-## Food Store — TP Unidad 3 Semana 1
+# Informe de Mediciones — Food Store
+## TP Unidad 3 Semana 1 — Índices, vistas y vistas materializadas
+
+---
+
+## Parte A — Índices (resumen)
+
+> Detalle completo con planes de ejecución, capturas y justificación en
+> `Parte_A_BASE_DE_DATOS.docx`. Se deja aquí el resumen para que
+> `informe_mediciones.md` reúna las tres partes en un solo documento,
+> tal como pide el punto 4 de la consigna.
+
+| Consulta | Antes (sin índice) | Índice creado | Después (con índice) |
+|---|---|---|---|
+| Pedidos `PENDIENTE` ordenados por fecha | Seq Scan, 150.171 filas descartadas, Sort en memoria, **1627 ms** | `idx_pedido_estado_fecha` — B-Tree compuesto y parcial `(estado_pedido, fecha_pedido DESC) WHERE eliminado_pedido = FALSE` | Bitmap Index Scan, 2.061→193 bloques leídos, **~101 ms** (mejora >90%) |
+| Búsqueda de producto por nombre (`LIKE 'pizza%'`) | Seq Scan sobre 50.002 filas, **370,97 ms** | `idx_producto_nombre_lower` — B-Tree funcional `lower(nombre_producto) varchar_pattern_ops` | Bitmap Index Scan, **0,207 ms** |
+| Detalles de un pedido (`id_pedido = 12500`) | Ya resuelta con Index Scan por `detalle_pedido_id_pedido_id_producto_key` (índice del `UNIQUE(id_pedido, id_producto)` de `schema.sql`) | **Ninguno** — ver corrección abajo | Sin cambios: mismo plan y mismo tiempo (~0,05–0,1 ms), con o sin índice nuevo |
+
+**Costo en escrituras:** carga masiva de 500 INSERT en `detalle_pedido`
+— **12,10 ms** de promedio antes de los índices vs. **18,40 ms**
+después (+52%). Se considera aceptable porque el sistema lee muchísimo
+más de lo que escribe.
+
+**Propuestas descartadas por sobreindexación:**
+
+1. Índice B-Tree individual sobre `pedido(forma_pago_pedido)`. Se
+   descartó porque la columna tiene baja cardinalidad (solo 3 valores
+   posibles), así que el planificador preferiría igual un `Seq Scan`;
+   el índice solo agregaría espacio en disco y penalizaría los
+   `INSERT` sin beneficio real en las lecturas.
+2. **(Corrección posterior)** `idx_detalle_pedido_id_pedido` sobre
+   `detalle_pedido(id_pedido)`, propuesto originalmente para la
+   Consulta 3. Al revisar el `schema.sql` se detectó que la tabla ya
+   tiene un índice compuesto `(id_pedido, id_producto)` por la
+   restricción `UNIQUE`, que por la regla del prefijo izquierdo ya
+   cubre cualquier filtro por `id_pedido` solo. Se verificó ejecutando
+   la Consulta 3 con y sin el índice nuevo: mismo plan
+   (`Index Scan using detalle_pedido_id_pedido_id_producto_key`) y
+   mismo tiempo en ambos casos. `indices.sql` se corrigió para no
+   crear este índice — el CREATE INDEX queda comentado, documentando
+   qué se descartó y por qué. Detalle completo en `duia.md`.
+
+---
+
+## Parte B — Vistas
 
 ---
 
@@ -235,3 +278,78 @@ Sin filas en ambos sentidos = equivalencia total ✅
 | `views.sql` | Definición de las tres vistas con `CREATE OR REPLACE VIEW` |
 | `verify_views.sql` | Consultas individuales y verificación por `EXCEPT` en ambas direcciones |
 | `informe_mediciones.md` | Este documento (incluye spec, vistas, criterio de seguridad y evidencia) |
+
+---
+
+## Parte C — Vista materializada: facturación por categoría y mes
+
+### 1. Reporte elegido y por qué es costoso
+
+Se eligió **"facturación total por categoría y mes"**: agrega sobre
+`detalle_pedido`, la tabla de mayor volumen del esquema. No es tráfico
+transaccional — es un panel gerencial que se consulta pocas veces por
+día — pero cada consulta recorre y suma todo el historial, lo que la
+vuelve la consulta agregada más pesada del sistema y la candidata
+natural a materializar (a diferencia de las tres consultas de la
+Parte A, que se resuelven con índice porque son de alta frecuencia y
+puntuales, no agregados).
+
+### 2. Medición: consulta original vs. vista materializada
+
+Medido sobre una carga de prueba de ~60.000 pedidos y ~180.000 filas
+de `detalle_pedido` (mismo orden de magnitud que la Parte A):
+
+| | Consulta agregada original (paso 0) | `SELECT * FROM mv_facturacion_categoria_mes` (paso 2) |
+|---|---|---|
+| Plan real obtenido | `Hash Join` (×3) + `GroupAggregate` con `Sort` externo en disco (8,1 MB), `Seq Scan` sobre `detalle_pedido`, `pedido`, `producto` y `categoria` | `Seq Scan` directo sobre la vista (39 filas: categorías × meses) |
+| Filas procesadas | 179.986 filas de `detalle_pedido` (tras filtrar `eliminado_detalle_pedido`) | 39 filas ya agregadas |
+| Execution Time | **298,12 ms** | **0,034 ms** |
+| Mejora | — | **~8.770×** |
+
+### 3. Verificación de equivalencia
+
+Se comparó el resultado de la vista contra la consulta manual
+equivalente (paso 0 de `materializadas.sql`): tanto la vista como la
+consulta manual dieron el mismo `SUM(total_facturado)` general
+(**$795.279.255,23** en la corrida de prueba), y la misma cantidad de
+filas agregadas (39, una por combinación categoría × mes con ventas).
+También se probó `REFRESH MATERIALIZED VIEW CONCURRENTLY` después de
+insertar un pedido nuevo: se ejecutó sin error gracias al índice único
+`ux_mv_facturacion_categoria_mes`, sin bloquear lecturas concurrentes
+sobre la vista.
+
+### 4. Frecuencia de refresco propuesta
+
+**Propuesta: refresco diario, fuera de horario pico** (por ejemplo
+03:00 AM), vía `pg_cron` o un job externo:
+
+```sql
+SELECT cron.schedule(
+  'refresh_facturacion_categoria_mes',
+  '0 3 * * *',
+  $$REFRESH MATERIALIZED VIEW CONCURRENTLY mv_facturacion_categoria_mes$$
+);
+```
+
+**Justificación:**
+- Es un reporte gerencial/analítico: nadie necesita ver reflejado al
+  instante un pedido confirmado hace 10 minutos en el total facturado
+  del mes.
+- Los pedidos se generan durante el día; un refresco nocturno asegura
+  que el panel de la mañana siguiente ya incluya el cierre del día
+  anterior completo.
+- `REFRESH CONCURRENTLY` (habilitado por el índice único
+  `ux_mv_facturacion_categoria_mes`) permite refrescar sin bloquear las
+  lecturas del panel, sin ventana de indisponibilidad.
+
+**Qué implica para los usuarios que el dato no se actualice en cada
+REFRESH:**
+- Entre un refresco y el siguiente hay una ventana de hasta ~24 h en
+  la que el reporte puede no reflejar pedidos confirmados
+  recientemente.
+- Si en algún momento se necesita el dato en tiempo real (por ejemplo,
+  un cierre de caja del día mismo), ese caso de uso debe resolverse
+  contra la consulta original o un `REFRESH` manual bajo demanda, no
+  contra esta vista con este cronograma — es el mismo trade-off
+  consistencia-vs-performance que se pide justificar, no una
+  limitación oculta.
